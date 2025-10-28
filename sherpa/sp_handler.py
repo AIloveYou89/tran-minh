@@ -1,5 +1,5 @@
 # RunPod Serverless: Vietnamese ASR (Sherpa-ONNX, Zipformer-RNNT)
-import os, time, uuid, base64, logging, subprocess
+import os, time, uuid, base64, logging, subprocess, json, re
 import runpod
 from huggingface_hub import snapshot_download
 
@@ -9,7 +9,7 @@ from huggingface_hub import snapshot_download
 MODEL_ID  = os.getenv("MODEL_ID", "hynt/Zipformer-30M-RNNT-6000h")
 MODEL_DIR = os.getenv("MODEL_DIR", "/models/Zipformer-30M-RNNT-6000h")
 OUT_DIR   = os.getenv("OUT_DIR", "/runpod-volume/jobs")
-NUM_THREADS = os.getenv("NUM_THREADS", "4")  # Default 4 threads
+NUM_THREADS = os.getenv("NUM_THREADS", "1")  # Default 1 thread
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -66,6 +66,40 @@ ensure_model()
 # ------------------------------
 # CORE HANDLER
 # ------------------------------
+def extract_transcript_from_output(stdout: str, stderr: str) -> str:
+    """
+    Parse transcript từ sherpa-onnx output.
+    Sherpa-onnx in JSON vào stderr chứa key "text"
+    """
+    # Method 1: Tìm JSON trong stderr
+    combined = stderr + "\n" + stdout
+    
+    # Tìm tất cả JSON objects có "text" key
+    json_pattern = r'\{[^{}]*"text"\s*:\s*"([^"]*)"[^{}]*\}'
+    matches = re.findall(json_pattern, combined)
+    
+    if matches:
+        # Lấy match cuối cùng (thường là kết quả cuối)
+        return matches[-1].strip()
+    
+    # Method 2: Parse JSON từng dòng
+    for line in combined.split('\n'):
+        line = line.strip()
+        if line.startswith('{') and '"text"' in line:
+            try:
+                obj = json.loads(line)
+                if 'text' in obj and obj['text'].strip():
+                    return obj['text'].strip()
+            except json.JSONDecodeError:
+                continue
+    
+    # Method 3: Fallback - tìm plain text sau filename.wav
+    lines = stdout.strip().split('\n')
+    if len(lines) > 1 and lines[0].endswith('.wav'):
+        return '\n'.join(lines[1:]).strip()
+    
+    return ""
+
 def handler(job):
     """
     Input JSON:
@@ -125,33 +159,25 @@ def handler(job):
     result = subprocess.run(cmd, text=True, capture_output=True)
     elapsed = time.time() - t0
 
-    # Log full output for debugging
-    log.info(f"[STDOUT] {result.stdout}")
-    if result.stderr:
-        log.warning(f"[STDERR] {result.stderr}")
-
     if result.returncode != 0:
+        log.error(f"[ERROR] Sherpa-ONNX failed with returncode {result.returncode}")
         return {
             "error": "Sherpa-ONNX failed",
             "returncode": result.returncode,
-            "stderr": result.stderr,
-            "stdout": result.stdout
+            "stderr": result.stderr[-500:],  # Last 500 chars
+            "stdout": result.stdout[-500:]
         }
 
-    # Parse transcript: sherpa-onnx-offline in ra plain text, mỗi file 1 dòng
-    # Format: filename.wav\nTranscript text here
-    transcript = ""
-    lines = result.stdout.strip().split("\n")
-    
-    # Bỏ dòng đầu (filename) nếu có
-    if len(lines) > 1 and lines[0].endswith(".wav"):
-        transcript = "\n".join(lines[1:]).strip()
-    else:
-        transcript = result.stdout.strip()
+    # Parse transcript từ CẢ stdout VÀ stderr
+    transcript = extract_transcript_from_output(result.stdout, result.stderr)
     
     if not transcript:
         log.warning("[TRANSCRIPT] Empty result!")
+        log.warning(f"[STDOUT] {result.stdout[:200]}")
+        log.warning(f"[STDERR] {result.stderr[:500]}")
         transcript = "(No transcript detected)"
+    else:
+        log.info(f"[TRANSCRIPT] Length: {len(transcript)} chars")
 
     # Save to file
     with open(out_path, "w", encoding="utf-8") as f:
@@ -159,6 +185,12 @@ def handler(job):
 
     log.info(f"[DONE] {audio_path} → {out_path} ({elapsed:.2f}s)")
     log.info(f"[TEXT] {transcript[:100]}...")  # Log 100 ký tự đầu
+
+    # Clean up temp file
+    try:
+        os.remove(fixed_wav)
+    except:
+        pass
 
     # Return result
     if inp.get("return") == "base64":
