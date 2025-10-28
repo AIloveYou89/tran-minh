@@ -1,16 +1,16 @@
 # RunPod Serverless: Vietnamese ASR (Sherpa-ONNX, Zipformer-RNNT)
-import os, time, uuid, base64, logging, subprocess, json
+import os, time, uuid, base64, logging, subprocess
 import runpod
 from huggingface_hub import snapshot_download
 
 # ------------------------------
-# CONFIG (đồng bộ style Spark)
+# CONFIG
 # ------------------------------
 MODEL_ID  = os.getenv("MODEL_ID", "hynt/Zipformer-30M-RNNT-6000h")
 MODEL_DIR = os.getenv("MODEL_DIR", "/models/Zipformer-30M-RNNT-6000h")
 OUT_DIR   = os.getenv("OUT_DIR", "/runpod-volume/jobs")
-NUM_THREADS = os.getenv("NUM_THREADS")  # vd: "1" | "2" | ...
-HF_TOKEN = os.getenv("HF_TOKEN")  # nếu repo private thì set thêm
+NUM_THREADS = os.getenv("NUM_THREADS", "4")  # Default 4 threads
+HF_TOKEN = os.getenv("HF_TOKEN")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -32,17 +32,34 @@ def ensure_model():
     else:
         log.info(f"[MODEL] Found model at {MODEL_DIR}")
 
-def pick_tokens_path(model_dir: str) -> str:
-    # Ưu tiên tokens.txt theo khuyến nghị sherpa-onnx
-    cand = [
-        os.path.join(model_dir, "tokens.txt"),
-        os.path.join(model_dir, "config.json"),  # fallback nếu model dùng json
-        os.path.join(model_dir, "bpe.model"),    # fallback khác (một số model)
-    ]
-    for p in cand:
+def find_model_files(model_dir: str):
+    """Tìm các file model cần thiết"""
+    # Tìm tokens file
+    tokens_candidates = ["tokens.txt", "bpe.model", "config.json"]
+    tokens_path = None
+    for t in tokens_candidates:
+        p = os.path.join(model_dir, t)
         if os.path.exists(p):
-            return p
-    raise FileNotFoundError("Cannot find tokens file (tokens.txt/config.json/bpe.model) in model dir")
+            tokens_path = p
+            break
+    
+    if not tokens_path:
+        raise FileNotFoundError("Cannot find tokens file in model dir")
+    
+    # Tìm model files (ưu tiên int8 nếu có)
+    encoder = os.path.join(model_dir, "encoder-epoch-20-avg-10.int8.onnx")
+    if not os.path.exists(encoder):
+        encoder = os.path.join(model_dir, "encoder-epoch-20-avg-10.onnx")
+    
+    decoder = os.path.join(model_dir, "decoder-epoch-20-avg-10.int8.onnx")
+    if not os.path.exists(decoder):
+        decoder = os.path.join(model_dir, "decoder-epoch-20-avg-10.onnx")
+    
+    joiner = os.path.join(model_dir, "joiner-epoch-20-avg-10.int8.onnx")
+    if not os.path.exists(joiner):
+        joiner = os.path.join(model_dir, "joiner-epoch-20-avg-10.onnx")
+    
+    return tokens_path, encoder, decoder, joiner
 
 ensure_model()
 
@@ -60,6 +77,7 @@ def handler(job):
     """
     inp = job.get("input", {})
     audio_path = inp.get("audio_path")
+    
     if not audio_path or not os.path.exists(audio_path):
         return {"error": f"Audio not found: {audio_path}"}
 
@@ -67,53 +85,100 @@ def handler(job):
     out_name = inp.get("outfile") or f"{job_id}.txt"
     out_path = os.path.join(OUT_DIR, out_name)
 
-    # Chuẩn hoá audio: mono + 16-bit; sample rate không bắt buộc 16k nhưng an toàn. :contentReference[oaicite:3]{index=3}
+    # Chuẩn hóa audio: mono + 16-bit + 16kHz
     fixed_wav = f"/tmp/{job_id}_16k.wav"
-    subprocess.run(
+    log.info(f"[AUDIO] Converting {audio_path} to 16kHz mono")
+    
+    ffmpeg_result = subprocess.run(
         ["ffmpeg", "-y", "-i", audio_path, "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", fixed_wav],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.PIPE, 
+        text=True
     )
+    
+    if ffmpeg_result.returncode != 0:
+        log.error(f"[AUDIO] FFmpeg error: {ffmpeg_result.stderr}")
+        return {"error": "Audio conversion failed", "details": ffmpeg_result.stderr}
 
-    tokens_path = pick_tokens_path(MODEL_DIR)
-    encoder = os.path.join(MODEL_DIR, "encoder-epoch-20-avg-10.onnx")
-    decoder = os.path.join(MODEL_DIR, "decoder-epoch-20-avg-10.onnx")
-    joiner  = os.path.join(MODEL_DIR, "joiner-epoch-20-avg-10.onnx")
+    # Tìm model files
+    try:
+        tokens_path, encoder, decoder, joiner = find_model_files(MODEL_DIR)
+        log.info(f"[MODEL] Using tokens: {os.path.basename(tokens_path)}")
+    except Exception as e:
+        return {"error": f"Model files not found: {str(e)}"}
 
+    # Build command
     cmd = [
         "sherpa-onnx-offline",
         f"--tokens={tokens_path}",
         f"--encoder={encoder}",
         f"--decoder={decoder}",
         f"--joiner={joiner}",
+        f"--num-threads={NUM_THREADS}",
         fixed_wav
     ]
-    if NUM_THREADS:
-        cmd.insert(1, f"--num-threads={NUM_THREADS}")  # CLI có tham số num-threads; ví dụ trong docs. :contentReference[oaicite:4]{index=4}
 
     log.info(f"[JOB] Decoding {audio_path} (job {job_id})")
+    log.info(f"[CMD] {' '.join(cmd)}")
+    
     t0 = time.time()
     result = subprocess.run(cmd, text=True, capture_output=True)
     elapsed = time.time() - t0
 
-    # Trích transcript từ stdout: sherpa-onnx in một dòng JSON có "text"/"timestamps" khi decode offline. :contentReference[oaicite:5]{index=5}
-    transcript_lines = []
-    for line in result.stdout.splitlines():
-        if '"text"' in line or '"result"' in line:
-            transcript_lines.append(line.strip())
-    transcript = "\n".join(transcript_lines).strip()
+    # Log full output for debugging
+    log.info(f"[STDOUT] {result.stdout}")
+    if result.stderr:
+        log.warning(f"[STDERR] {result.stderr}")
 
+    if result.returncode != 0:
+        return {
+            "error": "Sherpa-ONNX failed",
+            "returncode": result.returncode,
+            "stderr": result.stderr,
+            "stdout": result.stdout
+        }
+
+    # Parse transcript: sherpa-onnx-offline in ra plain text, mỗi file 1 dòng
+    # Format: filename.wav\nTranscript text here
+    transcript = ""
+    lines = result.stdout.strip().split("\n")
+    
+    # Bỏ dòng đầu (filename) nếu có
+    if len(lines) > 1 and lines[0].endswith(".wav"):
+        transcript = "\n".join(lines[1:]).strip()
+    else:
+        transcript = result.stdout.strip()
+    
+    if not transcript:
+        log.warning("[TRANSCRIPT] Empty result!")
+        transcript = "(No transcript detected)"
+
+    # Save to file
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(transcript)
 
     log.info(f"[DONE] {audio_path} → {out_path} ({elapsed:.2f}s)")
+    log.info(f"[TEXT] {transcript[:100]}...")  # Log 100 ký tự đầu
 
+    # Return result
     if inp.get("return") == "base64":
         b64 = base64.b64encode(transcript.encode("utf-8")).decode("utf-8")
-        return {"job_id": job_id, "elapsed_sec": round(elapsed, 2), "text_b64": b64}
-    return {"job_id": job_id, "elapsed_sec": round(elapsed, 2), "path": out_path, "text": transcript}
+        return {
+            "job_id": job_id, 
+            "elapsed_sec": round(elapsed, 2), 
+            "text_b64": b64,
+            "length": len(transcript)
+        }
+    
+    return {
+        "job_id": job_id, 
+        "elapsed_sec": round(elapsed, 2), 
+        "path": out_path, 
+        "text": transcript,
+        "length": len(transcript)
+    }
 
 # ------------------------------
-# START WORKER (RunPod handler)
+# START WORKER
 # ------------------------------
-# Kiểu handler này là đúng chuẩn serverless của RunPod. :contentReference[oaicite:6]{index=6}
 runpod.serverless.start({"handler": handler})
