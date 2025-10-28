@@ -11,10 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY sherpa/requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY sp_handler.py .
+COPY sherpa/sp_handler.py .
 
 # ENV mặc định đồng bộ style Spark
 ENV MODEL_ID="hynt/Zipformer-30M-RNNT-6000h" \
