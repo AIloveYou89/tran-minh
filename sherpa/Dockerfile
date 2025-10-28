@@ -14,7 +14,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-COPY rp_handler.py .
+COPY sp_handler.py .
 
 # ENV mặc định đồng bộ style Spark
 ENV MODEL_ID="hynt/Zipformer-30M-RNNT-6000h" \
