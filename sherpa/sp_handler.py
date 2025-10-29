@@ -9,7 +9,7 @@ from huggingface_hub import snapshot_download
 MODEL_ID  = os.getenv("MODEL_ID", "hynt/Zipformer-30M-RNNT-6000h")
 MODEL_DIR = os.getenv("MODEL_DIR", "/models/Zipformer-30M-RNNT-6000h")
 OUT_DIR   = os.getenv("OUT_DIR", "/runpod-volume/jobs")
-NUM_THREADS = os.getenv("NUM_THREADS", "1")  # Default 1 thread
+NUM_THREADS = os.getenv("NUM_THREADS", "1")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 os.makedirs(OUT_DIR, exist_ok=True)
@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("SherpaASR")
 
 # ------------------------------
-# MODEL DOWNLOAD (1 lần)
+# MODEL DOWNLOAD
 # ------------------------------
 def ensure_model():
     if not os.path.exists(MODEL_DIR) or not os.listdir(MODEL_DIR):
@@ -34,7 +34,6 @@ def ensure_model():
 
 def find_model_files(model_dir: str):
     """Tìm các file model cần thiết"""
-    # Tìm tokens file
     tokens_candidates = ["tokens.txt", "bpe.model", "config.json"]
     tokens_path = None
     for t in tokens_candidates:
@@ -46,7 +45,6 @@ def find_model_files(model_dir: str):
     if not tokens_path:
         raise FileNotFoundError("Cannot find tokens file in model dir")
     
-    # Tìm model files (ưu tiên int8 nếu có)
     encoder = os.path.join(model_dir, "encoder-epoch-20-avg-10.int8.onnx")
     if not os.path.exists(encoder):
         encoder = os.path.join(model_dir, "encoder-epoch-20-avg-10.onnx")
@@ -64,48 +62,97 @@ def find_model_files(model_dir: str):
 ensure_model()
 
 # ------------------------------
-# CORE HANDLER
+# PARSE OUTPUT
 # ------------------------------
-def extract_transcript_from_output(stdout: str, stderr: str) -> str:
+def extract_result_from_output(stdout: str, stderr: str) -> dict:
     """
-    Parse transcript từ sherpa-onnx output.
-    Sherpa-onnx in JSON vào stderr chứa key "text"
+    Parse full JSON result từ sherpa-onnx output.
+    Returns: {"text": "...", "timestamps": [...], "tokens": [...]}
     """
-    # Method 1: Tìm JSON trong stderr
     combined = stderr + "\n" + stdout
     
-    # Tìm tất cả JSON objects có "text" key
-    json_pattern = r'\{[^{}]*"text"\s*:\s*"([^"]*)"[^{}]*\}'
-    matches = re.findall(json_pattern, combined)
-    
-    if matches:
-        # Lấy match cuối cùng (thường là kết quả cuối)
-        return matches[-1].strip()
-    
-    # Method 2: Parse JSON từng dòng
+    # Method 1: Parse complete JSON object
     for line in combined.split('\n'):
         line = line.strip()
-        if line.startswith('{') and '"text"' in line:
+        if line.startswith('{') and '"text"' in line and '"timestamps"' in line:
             try:
                 obj = json.loads(line)
                 if 'text' in obj and obj['text'].strip():
-                    return obj['text'].strip()
+                    return {
+                        "text": obj['text'].strip(),
+                        "timestamps": obj.get('timestamps', []),
+                        "tokens": obj.get('tokens', []),
+                        "words": obj.get('words', [])
+                    }
             except json.JSONDecodeError:
                 continue
     
-    # Method 3: Fallback - tìm plain text sau filename.wav
-    lines = stdout.strip().split('\n')
-    if len(lines) > 1 and lines[0].endswith('.wav'):
-        return '\n'.join(lines[1:]).strip()
+    # Method 2: Regex fallback - tìm text only
+    json_pattern = r'\{[^{}]*"text"\s*:\s*"([^"]*)"[^{}]*\}'
+    matches = re.findall(json_pattern, combined)
+    if matches:
+        return {
+            "text": matches[-1].strip(),
+            "timestamps": [],
+            "tokens": [],
+            "words": []
+        }
     
-    return ""
+    return {"text": "", "timestamps": [], "tokens": [], "words": []}
 
+def create_word_segments(text: str, timestamps: list, tokens: list) -> list:
+    """
+    Tạo word-level segments từ token-level timestamps.
+    Returns: [{"word": "TÔI", "start": 0.00, "end": 0.12}, ...]
+    """
+    if not timestamps or not tokens or len(timestamps) != len(tokens):
+        return []
+    
+    segments = []
+    current_word = ""
+    word_start = None
+    
+    for i, (token, ts) in enumerate(zip(tokens, timestamps)):
+        token = token.strip()
+        
+        # Token bắt đầu bằng space = từ mới
+        if token.startswith(' ') or i == 0:
+            # Lưu từ cũ nếu có
+            if current_word and word_start is not None:
+                word_end = timestamps[i-1] if i > 0 else ts
+                segments.append({
+                    "word": current_word.strip(),
+                    "start": round(word_start, 2),
+                    "end": round(word_end, 2)
+                })
+            
+            # Bắt đầu từ mới
+            current_word = token
+            word_start = ts
+        else:
+            # Tiếp tục từ hiện tại
+            current_word += token
+    
+    # Lưu từ cuối cùng
+    if current_word and word_start is not None:
+        segments.append({
+            "word": current_word.strip(),
+            "start": round(word_start, 2),
+            "end": round(timestamps[-1], 2)
+        })
+    
+    return segments
+
+# ------------------------------
+# CORE HANDLER
+# ------------------------------
 def handler(job):
     """
     Input JSON:
     {
       "audio_path": "/runpod-volume/audio/test.wav",
-      "return": "text" | "base64",
+      "return": "text" | "json" | "base64",
+      "include_timestamps": true/false (default: true),
       "outfile": "optional_output.txt"
     }
     """
@@ -116,18 +163,16 @@ def handler(job):
         return {"error": f"Audio not found: {audio_path}"}
 
     job_id = str(uuid.uuid4())
-    out_name = inp.get("outfile") or f"{job_id}.txt"
+    out_name = inp.get("outfile") or f"{job_id}.json"
     out_path = os.path.join(OUT_DIR, out_name)
 
-    # Chuẩn hóa audio: mono + 16-bit + 16kHz
+    # Chuẩn hóa audio
     fixed_wav = f"/tmp/{job_id}_16k.wav"
     log.info(f"[AUDIO] Converting {audio_path} to 16kHz mono")
     
     ffmpeg_result = subprocess.run(
         ["ffmpeg", "-y", "-i", audio_path, "-ac", "1", "-ar", "16000", "-sample_fmt", "s16", fixed_wav],
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.PIPE, 
-        text=True
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
     
     if ffmpeg_result.returncode != 0:
@@ -153,7 +198,6 @@ def handler(job):
     ]
 
     log.info(f"[JOB] Decoding {audio_path} (job {job_id})")
-    log.info(f"[CMD] {' '.join(cmd)}")
     
     t0 = time.time()
     result = subprocess.run(cmd, text=True, capture_output=True)
@@ -164,51 +208,79 @@ def handler(job):
         return {
             "error": "Sherpa-ONNX failed",
             "returncode": result.returncode,
-            "stderr": result.stderr[-500:],  # Last 500 chars
-            "stdout": result.stdout[-500:]
+            "stderr": result.stderr[-500:]
         }
 
-    # Parse transcript từ CẢ stdout VÀ stderr
-    transcript = extract_transcript_from_output(result.stdout, result.stderr)
+    # Parse full result
+    asr_result = extract_result_from_output(result.stdout, result.stderr)
+    transcript = asr_result["text"]
     
     if not transcript:
         log.warning("[TRANSCRIPT] Empty result!")
-        log.warning(f"[STDOUT] {result.stdout[:200]}")
-        log.warning(f"[STDERR] {result.stderr[:500]}")
         transcript = "(No transcript detected)"
+        asr_result["text"] = transcript
     else:
-        log.info(f"[TRANSCRIPT] Length: {len(transcript)} chars")
+        log.info(f"[TRANSCRIPT] {transcript[:100]}...")
+        log.info(f"[TOKENS] {len(asr_result['tokens'])} tokens, {len(asr_result['timestamps'])} timestamps")
+
+    # Tạo word-level segments
+    include_timestamps = inp.get("include_timestamps", True)
+    if include_timestamps and asr_result["timestamps"]:
+        word_segments = create_word_segments(
+            transcript, 
+            asr_result["timestamps"], 
+            asr_result["tokens"]
+        )
+        asr_result["word_segments"] = word_segments
+        log.info(f"[SEGMENTS] Created {len(word_segments)} word segments")
 
     # Save to file
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(transcript)
+        json.dump(asr_result, f, ensure_ascii=False, indent=2)
 
     log.info(f"[DONE] {audio_path} → {out_path} ({elapsed:.2f}s)")
-    log.info(f"[TEXT] {transcript[:100]}...")  # Log 100 ký tự đầu
 
-    # Clean up temp file
+    # Clean up
     try:
         os.remove(fixed_wav)
     except:
         pass
 
-    # Return result
-    if inp.get("return") == "base64":
-        b64 = base64.b64encode(transcript.encode("utf-8")).decode("utf-8")
+    # Return based on format
+    return_format = inp.get("return", "json")
+    
+    if return_format == "text":
+        # Chỉ trả text thuần
         return {
-            "job_id": job_id, 
-            "elapsed_sec": round(elapsed, 2), 
-            "text_b64": b64,
-            "length": len(transcript)
+            "job_id": job_id,
+            "elapsed_sec": round(elapsed, 2),
+            "text": transcript,
+            "path": out_path
         }
     
-    return {
-        "job_id": job_id, 
-        "elapsed_sec": round(elapsed, 2), 
-        "path": out_path, 
-        "text": transcript,
-        "length": len(transcript)
-    }
+    elif return_format == "base64":
+        # Text as base64
+        b64 = base64.b64encode(transcript.encode("utf-8")).decode("utf-8")
+        return {
+            "job_id": job_id,
+            "elapsed_sec": round(elapsed, 2),
+            "text_b64": b64,
+            "path": out_path
+        }
+    
+    else:  # default: json
+        # Full result with timestamps
+        return {
+            "job_id": job_id,
+            "elapsed_sec": round(elapsed, 2),
+            "path": out_path,
+            "text": transcript,
+            "timestamps": asr_result.get("timestamps", []),
+            "tokens": asr_result.get("tokens", []),
+            "word_segments": asr_result.get("word_segments", []),
+            "num_tokens": len(asr_result.get("tokens", [])),
+            "num_words": len(asr_result.get("word_segments", []))
+        }
 
 # ------------------------------
 # START WORKER
